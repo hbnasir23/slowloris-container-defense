@@ -1,0 +1,20 @@
+# data & results are produced by runs
+data/*.csv
+results/*.png
+results/*.csv
+results/*.json
+results/*.log
+detector/models/*.json
+detector/models/*.pkl
+
+# python
+__pycache__/
+*.pyc
+
+# latex build artifacts
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/paper.pdf

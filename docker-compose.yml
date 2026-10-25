@@ -1,0 +1,76 @@
+# Slowloris containment testbed — ISOLATED LAB ONLY.
+# Every service below is self-hosted; no traffic ever leaves this host network.
+# The "attacker" only knows the hostname "victim" on the internal bridge.
+services:
+
+  victim:
+    build: ./victim
+    container_name: sl_victim
+    hostname: victim
+    networks:
+      lab:
+        ipv4_address: 172.28.0.10
+    ports:
+      - "127.0.0.1:8080:80"   # bound to loopback so nothing is exposed off-host
+    restart: unless-stopped
+
+  attacker:
+    build: ./attacker
+    container_name: sl_attacker
+    networks:
+      lab:
+        ipv4_address: 172.28.0.20
+    depends_on: [victim]
+    # Does nothing until experiments/run_all.sh execs the attack into it.
+    command: ["sleep", "infinity"]
+
+  benign:
+    build: ./benign
+    container_name: sl_benign
+    networks:
+      lab:
+        ipv4_address: 172.28.0.30
+    depends_on: [victim]
+    # Mixed legitimate load, incl. deliberately slow-but-honest clients.
+    command: ["sleep", "infinity"]
+
+  detector:
+    build: ./detector
+    container_name: sl_detector
+    # Share the victim's network namespace so the sniffer sees *all* traffic
+    # arriving at the victim, and so iptables rules land in the victim's stack.
+    network_mode: "service:victim"
+    cap_add: [NET_RAW, NET_ADMIN]       # sniff + iptables
+    depends_on: [victim]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # pause/disconnect attacker
+      - ./data:/app/data
+      - ./results:/app/results
+      - ./detector/models:/app/models
+    environment:
+      VICTIM_CONTAINER: sl_victim
+      ATTACKER_CONTAINER: sl_attacker
+      IFACE: eth0
+      MODE: ${MODE:-idle}              # idle | collect | defend
+    command: ["python", "-u", "run.py"]
+
+  dashboard:
+    build: ./dashboard
+    container_name: sl_dashboard
+    networks: [lab]
+    ports:
+      - "127.0.0.1:8090:8090"   # open http://localhost:8090 during the demo
+    depends_on: [victim]
+    volumes:
+      - ./results:/app/results
+    environment:
+      RESULTS_DIR: /app/results
+      STATUS_URL: http://victim:80/server-status?auto
+    restart: unless-stopped
+
+networks:
+  lab:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

@@ -1,0 +1,8 @@
+{
+  "first_mitigation_ts": 1792845213.33,
+  "first_restore_ts": 1792845245.255,
+  "n_mitigations": 2,
+  "avail_baseline_pct": 100.0,
+  "avail_during_attack_pct": 82.0,
+  "avail_recovered_pct": 100.0
+}

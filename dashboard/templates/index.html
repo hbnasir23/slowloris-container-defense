@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slowloris Containment — Live</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root{--bg:#0a1530;--panel:#0f1f45;--ink:#eef2ff;--muted:#9fb0d8;
+        --ok:#2ecc71;--bad:#e74c3c;--accent:#4f8cff;--line:#1e3566;}
+  *{box-sizing:border-box} html,body{margin:0}
+  body{background:var(--bg);color:var(--ink);
+       font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;padding:16px}
+  h1{font-size:20px;margin:0 0 2px} .sub{color:var(--muted);margin:0 0 16px}
+  .grid{display:grid;gap:14px;grid-template-columns:repeat(4,1fr)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+        padding:14px}
+  .span2{grid-column:span 2} .span4{grid-column:span 4}
+  .kpi{font-size:30px;font-weight:700} .kpi.sm{font-size:22px}
+  .label{color:var(--muted);font-size:12px;text-transform:uppercase;
+         letter-spacing:.04em}
+  .pill{display:inline-block;padding:3px 10px;border-radius:999px;font-weight:600}
+  .up{background:rgba(46,204,113,.15);color:var(--ok)}
+  .down{background:rgba(231,76,60,.15);color:var(--bad)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-weight:600}
+  .act{font-weight:700}
+  .DROP_IP,.KILL_CONNS{color:#ffb454} .ISOLATE_CONTAINER{color:var(--bad)}
+  .RECLAIM_POOL{color:var(--accent)} .RESTORE_IP,.RESTORE_CONTAINER{color:var(--ok)}
+  canvas{max-height:220px}
+  @media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}
+    .span2,.span4{grid-column:span 2}}
+</style>
+</head>
+<body>
+  <h1>Slowloris Containment — Live Monitor</h1>
+  <p class="sub">Detect → Isolate → Reclaim → Restore · real-time data from the running lab</p>
+
+  <div class="grid">
+    <div class="card"><div class="label">Service</div>
+      <div id="svc" class="kpi"><span class="pill down">…</span></div></div>
+    <div class="card"><div class="label">Worker saturation</div>
+      <div id="sat" class="kpi">–</div>
+      <div id="workers" class="label">busy – / idle –</div></div>
+    <div class="card"><div class="label">Attack probability</div>
+      <div id="maxp" class="kpi">–</div></div>
+    <div class="card"><div class="label">Offenders isolated</div>
+      <div id="off" class="kpi">0</div></div>
+
+    <div class="card span2"><div class="label">Legitimate-user availability (%)</div>
+      <canvas id="availChart"></canvas></div>
+    <div class="card span2"><div class="label">Worker saturation & offenders</div>
+      <canvas id="satChart"></canvas></div>
+
+    <div class="card span4"><div class="label">Automated action log</div>
+      <table><thead><tr><th>Time</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
+      <tbody id="log"><tr><td colspan="4" style="color:var(--muted)">Waiting for events…</td></tr></tbody></table>
+    </div>
+  </div>
+
+<script>
+const c=(id)=>document.getElementById(id);
+const mkLine=(ctx,label,color,y2label,color2)=>new Chart(ctx,{type:'line',
+  data:{labels:[],datasets:[
+    {label,data:[],borderColor:color,backgroundColor:color+'22',tension:.25,
+     pointRadius:0,borderWidth:2,yAxisID:'y'},
+    ...(y2label?[{label:y2label,data:[],borderColor:color2,tension:0,stepped:true,
+     pointRadius:0,borderWidth:2,yAxisID:'y2'}]:[])]},
+  options:{animation:false,responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{labels:{color:'#9fb0d8',boxWidth:12}}},
+    scales:{x:{ticks:{color:'#9fb0d8',maxTicksLimit:8},grid:{color:'#1e3566'}},
+      y:{min:0,ticks:{color:'#9fb0d8'},grid:{color:'#1e3566'}},
+      ...(y2label?{y2:{position:'right',min:0,ticks:{color:'#9fb0d8'},grid:{drawOnChartArea:false}}}:{})}}});
+
+const availChart=mkLine(c('availChart'),'Success rate %','#2ecc71','Latency (ms)','#e74c3c');
+const satChart=mkLine(c('satChart'),'Saturation %','#e74c3c','Offenders','#4f8cff');
+
+async function tick(){
+  let d; try{ d=await (await fetch('/api/state')).json(); }catch(e){ return; }
+  const w=d.worker||{};
+  c('svc').innerHTML = w.up ? '<span class="pill up">ONLINE</span>'
+                            : '<span class="pill down">UNREACHABLE</span>';
+  c('sat').textContent = w.sat==null?'–':Math.round(w.sat*100)+'%';
+  c('workers').textContent = 'busy '+(w.busy??'–')+' / idle '+(w.idle??'–');
+  c('maxp').textContent = d.latest&&d.latest.max_proba!=null?(+d.latest.max_proba).toFixed(3):'–';
+  const offNow = d.timeline.length?d.timeline[d.timeline.length-1].offenders:0;
+  c('off').textContent = offNow;
+
+  const av=d.availability.slice(-120);
+  availChart.data.labels=av.map(r=>r.t.toFixed(0)+'s');
+  // rolling success rate over last 5 samples
+  availChart.data.datasets[0].data=av.map((r,i,a)=>{
+    const s=a.slice(Math.max(0,i-4),i+1);return Math.round(100*s.reduce((x,y)=>x+y.ok,0)/s.length);});
+  availChart.data.datasets[1].data=av.map(r=>r.lat);
+  availChart.update();
+
+  const tl=d.timeline.slice(-120);
+  satChart.data.labels=tl.map((r,i)=>i);
+  satChart.data.datasets[0].data=tl.map(r=>Math.round(r.sat*100));
+  satChart.data.datasets[1].data=tl.map(r=>r.offenders);
+  satChart.update();
+
+  const log=d.actions.slice(-30).reverse();
+  c('log').innerHTML = log.length? log.map(a=>{
+    const t=new Date(parseFloat(a.ts)*1000).toLocaleTimeString();
+    return `<tr><td>${t}</td><td class="act ${a.action}">${a.action}</td>`+
+           `<td>${a.target||''}</td><td>${a.detail||''}</td></tr>`;}).join('')
+    : '<tr><td colspan="4" style="color:var(--muted)">No actions yet — launch the attack.</td></tr>';
+}
+tick(); setInterval(tick,1500);
+</script>
+</body>
+</html>

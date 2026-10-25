@@ -1,0 +1,26 @@
+[
+  {
+    "model": "LogisticRegression",
+    "precision": 0.9966,
+    "recall": 1.0,
+    "f1": 0.9983,
+    "roc_auc": 1.0,
+    "fpr": 0.0062
+  },
+  {
+    "model": "RandomForest",
+    "precision": 0.9989,
+    "recall": 1.0,
+    "f1": 0.9994,
+    "roc_auc": 1.0,
+    "fpr": 0.0021
+  },
+  {
+    "model": "XGBoost",
+    "precision": 0.9994,
+    "recall": 1.0,
+    "f1": 0.9997,
+    "roc_auc": 1.0,
+    "fpr": 0.001
+  }
+]
