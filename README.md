@@ -1,3 +1,6 @@
+https://claude.ai/artifact/S8Qwjy431dopsF7GLeMXpR
+claude generated explanation
+
 # Detection and Automated Mitigation of Slowloris in Containerized Environments
 
 SE-401 project. A **closed-loop, container-native** defense against the Slowloris
