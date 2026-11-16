@@ -1,0 +1,735 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{parskip}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{array}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{navy}{HTML}{0A2A66}
+\definecolor{accent}{HTML}{C0392B}
+\titleformat{\section}{\color{navy}\Large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\color{navy}\large\bfseries}{\thesubsection}{0.5em}{}
+\titlespacing*{\section}{0pt}{16pt}{6pt}
+\newcommand{\term}[1]{\textbf{#1}}
+\setlist{itemsep=2pt,topsep=3pt}
+\hypersetup{linkcolor=navy}
+
+\begin{document}
+
+% ---------------- COVER ----------------
+\begin{titlepage}
+\centering
+\vspace*{2cm}
+{\color{navy}\Huge\bfseries Viva Examination Report\par}
+\vspace{1cm}
+{\LARGE Detection and Automated Mitigation of\\ Application-Layer DDoS Attacks in\\ Containerized Environments\par}
+\vspace{0.6cm}
+{\large\itshape Attack Focus: Slowloris --- A Closed-Loop Defense\par}
+\vspace{2cm}
+{\large\textbf{Course:} SE-401 --- Information Security\par}
+\vspace{0.4cm}
+{\large\textbf{Group Members:}\par}
+{\large Summayah Mohammedy \quad Amna Khan\par}
+{\large Mariha Mahmood \quad Haris Bin Nasir\par}
+\vspace{2cm}
+{\large A complete, self-contained study and reference document\\ prepared for the viva examination.\par}
+\vfill
+{\itshape All attack experiments were conducted exclusively inside an isolated\\ laboratory network against a self-hosted target. No external system was involved.\par}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+% ---------------- EXEC SUMMARY ----------------
+\section{Executive Summary (Read This First)}
+In one paragraph: \emph{Slowloris} is a sneaky denial-of-service attack that
+quietly opens hundreds of connections to a web server and never finishes any of
+them, tying up all the server's ``workers'' until real users are locked out ---
+all while using almost no bandwidth, so normal alarms never fire. This is
+especially dangerous for modern apps packaged in \emph{containers} (Docker), which
+have small worker pools and defenses that cannot react once an attack begins. We
+built a system that \emph{watches} connections live, \emph{detects} the Slowloris
+pattern using a machine-learning model (XGBoost), \emph{automatically isolates}
+the attacker through the container runtime, and \emph{restores} service on its own
+after the threat passes --- a complete, automatic ``closed loop.'' On a real
+experiment it detected the attack with an F1 score of \textbf{0.9997}, a
+false-alarm rate of \textbf{0.1\%}, restored service availability from a crash
+back to \textbf{100\%} within seconds, and \textbf{never once} blocked a
+legitimate slow user. The novelty is not the detector --- it is the \emph{automatic
+detect$\rightarrow$isolate$\rightarrow$recover loop that runs inside the container
+runtime}, together with a layer-7 feature that tells a slow attacker apart from a
+slow honest user.
+
+\textbf{How to use this document for the viva:} Part~I teaches the concepts from
+zero. Parts~II--IX explain the project itself. Part~XII is a glossary of every
+term. \textbf{Part~XIII is a list of likely viva questions with model answers ---
+study that most.} Part~XIV is the live-demo script.
+
+% ---------------- PART I ----------------
+\section{Part I --- Foundations (Assume No Prior Knowledge)}
+
+\subsection{What a web server does}
+A \term{web server} is a program that waits for \term{clients} (browsers, apps) to
+connect and ask for something over \term{HTTP}, the language of the web. For each
+connection, the server assigns a \term{worker} (a thread or process) to read the
+request, do the work, and send a reply. A server has a \emph{limited number of
+workers} --- for example 50. If all 50 are busy, the 51st user must wait or is
+refused. This limit is the resource an attacker tries to exhaust.
+
+\subsection{How an HTTP request is structured (the key to everything)}
+An HTTP request is sent as text, line by line:
+\begin{itemize}
+  \item A \term{request line}: e.g. \texttt{GET /page HTTP/1.1}
+  \item Several \term{header} lines: e.g. \texttt{Host: example.com}
+  \item A \textbf{blank line} --- this is the crucial part. The blank line
+  (technically \texttt{CRLFCRLF}, two line-breaks) signals ``the headers are
+  finished; now process my request.''
+\end{itemize}
+Until that blank line arrives, the server keeps the worker \emph{waiting}, holding
+the connection open, assuming the client is just slow. \textbf{Slowloris abuses
+this waiting.}
+
+\subsection{DoS vs DDoS}
+A \term{DoS} (Denial of Service) attack tries to make a service unavailable to its
+real users. A \term{DDoS} (Distributed DoS) does the same from \emph{many} sources
+at once. ``Availability'' is one of the three pillars of security (Confidentiality,
+Integrity, Availability --- the \term{CIA triad}); DoS/DDoS attacks target
+availability.
+
+\subsection{Network-layer vs application-layer attacks}
+\begin{itemize}
+  \item \term{Network/volumetric attacks} flood the target with huge traffic to
+  clog the pipe (e.g. a UDP flood). They are loud and easy to spot by volume.
+  \item \term{Application-layer (Layer-7) attacks} are quiet. They send a small
+  number of \emph{valid-looking} requests that abuse how the application behaves.
+  Slowloris is Layer-7: it uses tiny traffic but exhausts a server resource.
+\end{itemize}
+
+\subsection{What Slowloris actually does (step by step)}
+\begin{enumerate}
+  \item The attacker opens many TCP connections to the server (e.g. 200).
+  \item On each, it sends the request line and a few headers --- but \emph{not}
+  the terminating blank line.
+  \item Every few seconds it sends \emph{one more} harmless header line on each
+  connection. This resets the server's idle timer, so the server keeps waiting.
+  \item Because the request never finishes, each connection keeps its worker
+  occupied \emph{forever}.
+  \item With 200 held connections and only 50 workers, the pool is exhausted.
+  Real users get no worker and the site appears down.
+\end{enumerate}
+\textbf{Analogy:} imagine 200 people at a shop's 50 service counters, each
+pretending to still be deciding their order, mumbling one more word every few
+seconds so the clerk can't leave. No shouting, no crowd --- but nobody else can be
+served.
+
+\subsection{What containers are, and why they matter here}
+A \term{container} (via \term{Docker}) packages an application with everything it
+needs so it runs the same anywhere. \term{Kubernetes} orchestrates many containers
+across machines. Containers are the default way modern apps are deployed. Two facts
+make Slowloris worse for them:
+\begin{itemize}
+  \item \textbf{Small pools:} each container is sized for modest load, so its
+  worker pool is small and exhausts in \emph{seconds}.
+  \item \textbf{Static defenses:} container isolation (\term{namespaces},
+  \term{cgroups}, \term{network policies}) is configured in advance. It partitions
+  resources but does \emph{not} watch or react to a slow attack in progress.
+  \item \textbf{Multi-tenancy:} many tenants share a host, so one compromised
+  container can attack its neighbours over the internal network.
+\end{itemize}
+
+% ---------------- PART II ----------------
+\section{Part II --- The Problem and Motivation}
+
+\subsection{Problem statement}
+Slowloris exhausts a containerized web service's worker pool using negligible
+bandwidth and traffic that looks like normal slow clients. Volume-based defenses
+miss it, and static container controls cannot react while it is happening. Because
+it develops over seconds-to-minutes, a human operator cannot respond in time.
+
+\subsection{Why existing defenses fail}
+\begin{itemize}
+  \item \textbf{Volumetric detection} looks for high traffic --- Slowloris has
+  almost none, so it is invisible to it.
+  \item \textbf{Static timeouts} (e.g. Apache's \texttt{mod\_reqtimeout}) can help,
+  but an attacker who trickles \emph{within} the timeout window evades them, and a
+  too-aggressive timeout cuts off genuinely slow honest users.
+  \item \textbf{Manual response} is too slow; by the time an alert is noticed,
+  downtime has already occurred.
+\end{itemize}
+
+\subsection{Motivation}
+The missing piece is not another offline detector but an \emph{automatic control
+loop} that observes, decides, acts through the container runtime, and safely
+reverses itself --- all in real time, with no human in the loop, and without
+harming legitimate slow users.
+
+% ---------------- PART III ----------------
+\section{Part III --- The Research}
+
+\subsection{What ``the research'' is}
+This is applied security research combining \emph{machine-learning-based intrusion
+detection} with \emph{automated, container-native incident response}. We study
+three research questions:
+\begin{itemize}
+  \item \textbf{RQ1 (Accuracy):} Can we detect Slowloris accurately, and crucially,
+  \emph{without} flagging slow-but-honest clients?
+  \item \textbf{RQ2 (Responsiveness):} How fast does the closed loop detect,
+  mitigate, and recover, and does availability actually return?
+  \item \textbf{RQ3 (Cost):} What does the defense cost in overhead and false
+  isolations, and how does it compare to simpler approaches?
+\end{itemize}
+
+\subsection{What others have done (related work)}
+\begin{itemize}
+  \item \textbf{ML detectors} for application-layer DDoS (e.g. Sharif et al.\ with
+  genetic algorithms; Praseed \& Thilagam with request-pattern signatures) focus on
+  \emph{detection accuracy on recorded data}.
+  \item \textbf{Slow-DoS analysis} (Cambiaso et al.) defines and categorises slow
+  attacks --- the basis of our threat model.
+  \item \textbf{SDN mitigation} (Lukaseder et al.) acts on slow attacks at the
+  network fabric using packet timing, but not inside the container runtime and
+  without a layer-7 completion signal.
+  \item \textbf{Datasets} (CIC-IDS2017, CIC-DDoS2019) include slow-rate subsets but
+  are flow-level, so they \emph{cannot} see whether HTTP headers completed.
+\end{itemize}
+
+\subsection{The gap we fill}
+Prior work overwhelmingly stops at detection on offline data. Very little
+\emph{closes the loop}: detecting \emph{and} automatically mitigating a slow attack
+in real time, \emph{inside a container runtime}, \emph{while protecting
+slow-but-honest clients}. That combination --- layer-7 feature + automatic
+mitigation + container-native --- is our contribution.
+
+% ---------------- PART IV ----------------
+\section{Part IV --- Aims and Objectives (What We Set Out to Do)}
+\begin{enumerate}
+  \item Build a realistic, reproducible container testbed where Slowloris
+  genuinely takes a service down.
+  \item Engineer features --- including a \emph{layer-7 header-completion}
+  feature --- that distinguish the attack from honest slow traffic.
+  \item Train and compare ML models (XGBoost vs Random Forest vs Logistic
+  Regression) to detect the attack.
+  \item Build an \emph{automatic} mitigator that isolates the offender through the
+  Docker runtime and restores service after a cooldown.
+  \item Measure not just accuracy but \emph{availability, time-to-mitigate, and
+  false isolations}, and prove honest slow users are never blocked.
+  \item Provide a live dashboard and a full research paper.
+\end{enumerate}
+
+% ---------------- PART V ----------------
+\section{Part V --- What We Built (System Design)}
+
+\subsection{Architecture: five cooperating containers}
+All five run on one isolated Docker bridge network:
+\begin{itemize}
+  \item \textbf{victim} --- Apache web server with a deliberately small worker pool
+  (\texttt{MaxRequestWorkers = 50}); the service we protect.
+  \item \textbf{attacker} --- a lab-only Slowloris script, hard-locked to the lab
+  subnet (it refuses any other target).
+  \item \textbf{benign} --- generates both fast normal users \emph{and}
+  slow-but-honest users (the hard negatives).
+  \item \textbf{detector} --- the brain: sniffs traffic, extracts features, runs
+  XGBoost, and drives the mitigator. It \emph{shares the victim's network
+  namespace}, so it sees all traffic to the victim and its firewall rules take
+  effect there; it also holds the Docker socket to act on containers.
+  \item \textbf{dashboard} --- a live web page (\texttt{localhost:8090}) showing
+  saturation, detections, and the action log in real time.
+\end{itemize}
+
+\subsection{The four-stage closed loop}
+Every 2 seconds the detector runs: \textbf{Monitor $\rightarrow$ Classify
+$\rightarrow$ Isolate $\rightarrow$ Restore.}
+\begin{enumerate}
+  \item \textbf{Monitor:} track every connection's duration, bytes/sec, packet
+  timing, and whether its headers ever completed.
+  \item \textbf{Classify:} score each flow with XGBoost; flag a source only if it
+  holds many long-lived \emph{incomplete} flows \emph{and} the server is saturated.
+  \item \textbf{Isolate:} reset the held connections, drop the source IP,
+  disconnect the attacker container, and reclaim the worker pool.
+  \item \textbf{Restore:} after a cooldown with no further attack, automatically
+  undo everything.
+\end{enumerate}
+
+\subsection{Feature engineering (and why each feature)}
+For each connection we compute the following, grouped by the invariant it captures.
+\begin{longtable}{>{\raggedright}p{0.32\textwidth} p{0.60\textwidth}}
+\toprule
+\textbf{Feature} & \textbf{Why it matters} \\
+\midrule
+\endhead
+\texttt{duration} & Slowloris flows are long-lived. \\
+\texttt{bytes\_in}, \texttt{bytes\_per\_sec} & Attack throughput is near zero. \\
+\texttt{pkt\_count} & Few packets over a long time. \\
+\texttt{mean\_iat}, \texttt{std\_iat} & Inter-arrival timing; a scripted trickle is
+very \emph{regular} (low variance), unlike a human. \\
+\texttt{idle\_time} & Time since last byte. \\
+\texttt{header\_lines} & Count of header lines seen. \\
+\texttt{headers\_complete} & \textbf{The layer-7 key:} 1 if the terminating blank
+line was seen. Attack = always 0; honest = eventually 1. \\
+\texttt{incomplete\_ratio} & $1 -$ \texttt{headers\_complete}. \\
+\texttt{small\_pkt\_ratio} & Fraction of tiny packets (the trickle). \\
+\texttt{conns\_from\_src} & One attacker holds \emph{many} flows at once. \\
+\bottomrule
+\end{longtable}
+No single feature is enough (a big upload is slow; a mobile user is bursty; a
+crawler is concurrent), but their \emph{conjunction}, especially the completion
+bit, is highly specific to the attack.
+
+\subsection{The machine-learning model}
+We use \term{XGBoost} (a gradient-boosted decision-tree ensemble), with
+\term{Random Forest} and \term{Logistic Regression} as baselines. Trees learn
+\emph{feature interactions} (e.g. ``long AND incomplete AND low-throughput''),
+which is why they beat the linear baseline. We use \term{SHAP} to explain which
+features drove decisions --- a check that the model relies on the intended signals,
+not an artefact.
+
+\subsection{The adaptive threshold (plain-English)}
+A naive detector that fires on the model score alone would risk blocking slow
+honest users. Ours fires only when \emph{both}:
+\begin{itemize}
+  \item the source holds at least $k=20$ flows that are model-flagged,
+  \emph{incomplete}, and older than $d=8$ seconds; \emph{and}
+  \item the server is genuinely under pressure (worker saturation
+  $\geq 80\%$).
+\end{itemize}
+The 8-second duration gate is key: an honest request may be briefly mid-header but
+completes in under a second, so it never accumulates. Gating on real saturation
+means the system is inert while the server is healthy.
+
+\subsection{The mitigation ladder}
+Actions escalate from least to most disruptive, each logged with a timestamp:
+reset the held connections $\rightarrow$ drop the source IP in the firewall
+$\rightarrow$ disconnect the attacker container $\rightarrow$ reclaim the worker
+pool so legitimate users regain service.
+
+\subsection{Cooldown / restore and the grace period}
+A state machine lifts the firewall drop and reconnects the container after a
+cooldown with no further offence --- no permanent block to clean up manually. A
+short \emph{grace period} after a reclaim prevents the surge of returning honest
+users from being mistaken for a new attack.
+
+\subsection{The live dashboard}
+A small web app reads the same logs the system writes and shows, live: service
+online/offline, worker saturation, attack probability, offenders isolated, an
+availability chart, and the full automated action log.
+
+% ---------------- PART VI ----------------
+\section{Part VI --- How We Did It (Implementation and How to Run)}
+
+\subsection{Technology stack}
+Docker \& Docker Compose (the lab), Python (attacker, benign, detector), Scapy
+(packet sniffing), XGBoost + scikit-learn (ML), SHAP (explainability), Flask (the
+dashboard), and the Docker SDK + iptables (the actuator).
+
+\subsection{Dataset collection and labelling}
+We run the detector in a passive ``collect'' mode while generating fast-benign,
+slow-honest, and attack traffic together. Each flow is auto-labelled by source
+(attacker container $=$ attack, everything else $=$ benign), giving a clean,
+automatically-labelled dataset whose negative class contains genuinely slow honest
+flows. The result was about 9{,}000 labelled rows.
+
+\subsection{How to run the live demo}
+\begin{enumerate}
+  \item \texttt{docker compose up -d} --- start the whole lab + dashboard.
+  \item Open \texttt{http://localhost:8090} in a browser.
+  \item Launch the attack:\\
+  \texttt{docker compose exec -d attacker python slowloris\_lab.py --target victim
+  --sockets 200 --interval 3 --duration 60}
+  \item Watch the dashboard: saturation climbs, attack probability spikes, the
+  offender is isolated, and availability snaps back.
+  \item \texttt{docker compose down} --- stop everything.
+\end{enumerate}
+
+\subsection{How to run the full experiment (regenerate everything)}
+\texttt{bash experiments/run\_all.sh} collects data, trains the models, runs the
+closed-loop defense experiment, and emits every figure and table.
+\texttt{python experiments/make\_results\_tex.py} then injects the real numbers
+into the paper.
+
+\subsection{How to read the results}
+Outputs land in \texttt{results/}: \texttt{metrics.json} (detection scores),
+\texttt{summary.json} (availability + timing), \texttt{actions.csv} (every
+automated action with timestamps), \texttt{timeline.csv} (saturation over time),
+\texttt{availability.csv} (user success over time), and the figures
+\texttt{fig\_*.png}.
+
+% ---------------- PART VII ----------------
+\section{Part VII --- What We Achieved (Results)}
+
+\subsection{Detection accuracy (RQ1)}
+\begin{center}
+\begin{tabular}{lccccc}
+\toprule
+Model & Precision & Recall & F1 & ROC-AUC & FPR \\
+\midrule
+Logistic Regression & 0.9966 & 1.00 & 0.9983 & 1.00 & 0.0062 \\
+Random Forest & 0.9989 & 1.00 & 0.9994 & 1.00 & 0.0021 \\
+\textbf{XGBoost} & \textbf{0.9994} & \textbf{1.00} & \textbf{0.9997} & \textbf{1.00} & \textbf{0.0010} \\
+\bottomrule
+\end{tabular}
+\end{center}
+SHAP ranked \texttt{headers\_complete} and \texttt{incomplete\_ratio} as the two
+most important features --- exactly the layer-7 signals our design emphasises.
+
+\subsection{Availability and responsiveness (RQ2)}
+\begin{center}
+\begin{tabular}{lcl}
+\toprule
+Phase & Availability & Meaning \\
+\midrule
+Baseline & 100\% & Healthy \\
+During attack & 82\% & Brief dip; mitigation fires in $\approx$1\,s \\
+After mitigation & 100\% & Pool reclaimed \\
+Recovered & 100\% & Attacker auto-released \\
+\bottomrule
+\end{tabular}
+\end{center}
+Time-to-detect: within one 2-second cycle. Time-to-mitigate: about 1 second.
+False isolations of benign users: \textbf{zero}. The service was down only for the
+few seconds between saturation and reclaim --- not for the whole attack as in the
+undefended case.
+
+\subsection{Interpretation (what the numbers mean)}
+The near-perfect detection scores reflect that \emph{once the header-completion
+feature exists, the two classes are cleanly separable}. The important results are
+therefore (a) the very low false-positive rate against slow-honest traffic, and
+(b) the working closed loop that restores availability automatically. Accuracy
+alone is not the achievement; the automatic recovery with zero collateral damage
+is.
+
+% ---------------- PART VIII ----------------
+\section{Part VIII --- Novelty and Contributions}
+\begin{enumerate}
+  \item \textbf{A layer-7 header-completion feature} that separates a slow attacker
+  from a slow honest user --- information flow-only detectors cannot see.
+  \item \textbf{An adaptive threshold} that combines the ML score with live server
+  saturation, so honest slow clients are safe while the server is healthy.
+  \item \textbf{A closed-loop, container-native mitigator} that isolates the
+  offender through the Docker runtime, reclaims the pool, and auto-restores --- the
+  core contribution.
+  \item \textbf{A reproducible testbed, live dashboard, and evaluation} that
+  measures availability and false isolations, not just detection accuracy.
+\end{enumerate}
+
+\section{Part IX --- Significance (What It Means)}
+Detection without response leaves a human in the critical path, which is too slow
+for an attack that unfolds in seconds. By turning detection into an automatic,
+reversible action expressed in the container runtime's own vocabulary
+(``disconnect this container,'' ``restart that one''), the defense fits how modern
+platforms already manage tenants and composes with existing orchestration. The
+result is a service that stays available through an attack with no operator action
+and no harm to legitimate users --- a practical pattern for multi-tenant container
+hosting.
+
+% ---------------- PART X ----------------
+\section{Part X --- Limitations and Honest Caveats}
+\begin{itemize}
+  \item \textbf{Encryption:} the header-completion feature needs to read request
+  bytes, so it applies to plain HTTP or behind a TLS-terminating proxy; end-to-end
+  HTTPS would require terminating TLS at the monitor.
+  \item \textbf{Evasion:} an attacker who randomises timing stresses the timing
+  features, but not header completion, which stays discriminative.
+  \item \textbf{Single host:} the testbed is one host with one attacker;
+  distributed sources and cluster-wide (Kubernetes) isolation are future work.
+  \item \textbf{Tuning:} the thresholds are deployment-specific and must be fitted
+  to a service's pool size and traffic.
+  \item \textbf{The WSL2 reclaim caveat (important --- examiners may probe this):}
+  On a normal Linux server the mitigator force-closes the attacker's sockets
+  instantly using \texttt{ss -K} (the kernel's \texttt{SOCK\_DESTROY} feature). Our
+  test machine runs the WSL2 kernel, which does \emph{not} implement
+  \texttt{SOCK\_DESTROY}, so network-disconnect alone leaves the half-open sockets
+  in the kernel's backlog where fresh workers re-accept them. To reclaim reliably
+  on this kernel we therefore \emph{restart the victim container}, which clears the
+  backlog and brings up a fresh pool. The availability probe runs on the host, so
+  the recovery it measures is real and independent of this. This is a platform
+  detail, not a flaw in the approach: on production Linux the lighter socket-kill
+  would be used instead.
+\end{itemize}
+
+\section{Part XI --- Future Work}
+Kubernetes deployment with NetworkPolicy-based pod isolation; eBPF-based monitoring
+for lower overhead and line-rate feature extraction; validation on public
+benchmarks (CIC-IDS2017, CIC-DDoS2019); distinguishing genuine flash crowds from
+attacks; and extension to the rest of the slow-DoS family (Slow POST, Slow Read,
+HTTP/2 variants) and to TLS-terminating deployments.
+
+% ---------------- PART XII GLOSSARY ----------------
+\section{Part XII --- Glossary of Terms}
+\begin{description}[leftmargin=0pt,style=nextline]
+  \item[Adaptive threshold] A decision rule that combines the model score with live
+  server saturation, so action is taken only when the server is genuinely
+  threatened.
+  \item[Application-layer (Layer-7) attack] An attack that abuses application
+  behaviour (like HTTP) using valid-looking requests, rather than raw traffic
+  volume.
+  \item[cgroups] Linux control groups; bound a container's CPU and memory.
+  \item[CIA triad] Confidentiality, Integrity, Availability --- the three core
+  security goals. DoS attacks target Availability.
+  \item[Closed loop] A control system that senses, decides, acts, and then observes
+  the effect and adjusts --- here, detect $\rightarrow$ isolate $\rightarrow$
+  restore, automatically.
+  \item[Container] A lightweight, isolated package of an app and its dependencies
+  (via Docker) that runs consistently anywhere.
+  \item[conntrack] A Linux tool to view/remove kernel connection-tracking entries;
+  used to tear down the attacker's connections.
+  \item[CRLFCRLF] The two consecutive line-breaks (a blank line) that terminate an
+  HTTP header block. Slowloris never sends it.
+  \item[DDoS] Distributed Denial of Service --- a DoS from many sources.
+  \item[DoS] Denial of Service --- making a service unavailable to its users.
+  \item[Docker] The most common container platform.
+  \item[eBPF] A Linux technology for safe, fast in-kernel programs; proposed for
+  lower-overhead monitoring in future work.
+  \item[F1 score] The harmonic mean of precision and recall; a single balanced
+  measure of detection quality (1.0 is perfect).
+  \item[False-positive rate (FPR)] The fraction of benign items wrongly flagged as
+  attacks. Low FPR means honest users are not blocked.
+  \item[Feature] A measured property of a connection (e.g.\ duration) fed to the
+  model.
+  \item[Flow] One connection, tracked over time (keyed by source IP and port).
+  \item[Header completion] Whether an HTTP request's headers finished (the blank
+  line arrived). Our key layer-7 feature.
+  \item[iptables] The Linux firewall tool used to drop the attacker's IP.
+  \item[Kubernetes] A system for orchestrating many containers across machines.
+  \item[MaxRequestWorkers] Apache's limit on simultaneous worker processes; the
+  pool Slowloris exhausts (set to 50 in our lab).
+  \item[Namespaces] Linux feature that gives a container its own isolated view of
+  processes, network, etc.
+  \item[Network policy] A Kubernetes rule controlling which pods may talk to which;
+  static and preventive.
+  \item[Precision] Of the items flagged as attacks, the fraction that truly were.
+  \item[Recall] Of the true attacks, the fraction that were caught.
+  \item[ROC-AUC] A threshold-independent measure of how well the model separates
+  the two classes (1.0 is perfect).
+  \item[Saturation] Fraction of workers busy (busy / (busy + idle)); our pressure
+  signal.
+  \item[Scapy] A Python library for capturing and inspecting packets.
+  \item[SHAP] A method that attributes a model's decision to individual features
+  (explainability).
+  \item[Slow-DoS family] Low-bandwidth attacks that hold a server resource:
+  Slowloris (slow headers), Slow POST (slow body), Slow Read (slow response).
+  \item[Slowloris] The attack studied here: many connections with never-finished
+  HTTP headers, exhausting the worker pool.
+  \item[SOCK\_DESTROY] A Linux kernel feature (used via \texttt{ss -K}) that
+  force-closes a socket; absent on the WSL2 test kernel (see Part X).
+  \item[XGBoost] A high-performance gradient-boosted decision-tree model; our main
+  classifier.
+\end{description}
+
+% ---------------- PART XIII Q&A ----------------
+\section{Part XIII --- Likely Viva Questions and Model Answers}
+\textbf{Study this section most. Answers are written the way you would say them.}
+
+\begin{description}[leftmargin=0pt,style=nextline]
+\item[Q1. In one sentence, what is your project?]
+An automatic, container-native system that detects a Slowloris slow-DoS attack in
+real time using machine learning and then isolates the attacker and restores the
+service on its own, without blocking legitimate slow users.
+
+\item[Q2. What is Slowloris and why is it hard to detect?]
+It opens many connections and keeps each alive with partial, never-finished HTTP
+headers, exhausting the server's worker pool. It is hard to detect because it uses
+almost no bandwidth and its packets look like a normal slow client, so
+volume-based defenses miss it.
+
+\item[Q3. Why is this worse in containers?]
+Containers have small worker pools that exhaust in seconds, and their isolation
+controls are configured in advance and cannot react to an attack in progress. In
+multi-tenant hosting, one compromised container can attack its neighbours.
+
+\item[Q4. What is the single most important idea in your work?]
+The \emph{header-completion} feature combined with an \emph{automatic closed loop}.
+Completion tells a slow attacker (never finishes) from a slow honest user
+(eventually finishes); the loop acts on that in real time.
+
+\item[Q5. Why machine learning and not a simple rule?]
+A single rule either misses variants or flags honest slow users. The attack is
+defined by a \emph{combination} of properties (long, incomplete, low-throughput,
+concurrent). A tree model learns that combination, and our adaptive threshold adds
+server saturation so we only act when truly threatened.
+
+\item[Q6. Why XGBoost specifically?]
+It is a strong gradient-boosted tree model that learns feature interactions and
+handles tabular features well. We compared it against Random Forest and Logistic
+Regression; XGBoost had the best F1 and the lowest false-positive rate.
+
+\item[Q7. Your accuracy is 99.97\% --- isn't that suspiciously high / overfitting?]
+It is high because, once the header-completion feature exists, the classes are
+genuinely easy to separate --- an unfinished request is structurally different from
+a finished one. We guard against a spurious result by (a) including genuinely slow
+honest clients as hard negatives, (b) using a held-out test split, and (c) checking
+with SHAP that the model relies on the completion features, not on something like
+the attacker's IP. The real achievement is the near-zero false-positive rate and
+the working recovery, not the raw accuracy.
+
+\item[Q8. How do you avoid blocking a legitimate slow user?]
+Three safeguards: we only act when the server is actually saturated ($\geq 80\%$);
+we only count connections that stay \emph{incomplete} for more than 8 seconds
+(honest ones finish in under a second); and we apply a grace period after mitigation
+so returning users are not mistaken for a new attack. In our runs, zero honest
+users were ever blocked.
+
+\item[Q9. Walk me through what happens from attack start to recovery.]
+The attack opens 200 connections and saturates the 50-worker pool within seconds.
+The monitor sees many long-lived incomplete flows from one source; the classifier
+flags it because saturation is high; the mitigator resets the connections, drops
+the IP, disconnects the attacker container, and reclaims the pool. Availability
+returns within a few seconds. After a cooldown with no further attack, the firewall
+rule is lifted and the container reconnected automatically.
+
+\item[Q10. What does ``closed loop'' mean and why does it matter?]
+It means the system not only detects but also acts and then observes and reverses
+itself --- sense, decide, act, recover. It matters because the attack unfolds in
+seconds, far faster than a human can respond, so the response must be automatic.
+
+\item[Q11. What is the adaptive threshold?]
+Instead of acting on the model score alone, we require two things together: enough
+long-lived incomplete flows from one source, \emph{and} the server being genuinely
+saturated. This keeps the system inert when the server is healthy, protecting slow
+honest users.
+
+\item[Q12. How did you build your dataset and is it biased?]
+We generated fast-benign, slow-honest, and attack traffic together in our lab and
+auto-labelled each flow by its source container. It is narrower than a public
+benchmark, which we acknowledge, but it is precisely labelled and importantly its
+benign class contains real slow clients. Our methodology also admits public
+datasets (CIC-IDS2017/2019) for future validation.
+
+\item[Q13. How does mitigation actually stop the attack?]
+We drop the attacker's IP in the firewall (stopping new/continued traffic),
+disconnect the attacker container from the network, and reclaim the worker pool so
+the seized slots are freed for real users. The attacker, now isolated, cannot
+re-grab them.
+
+\item[Q14. Why do you restart the victim container to reclaim --- isn't that heavy?]
+On a normal Linux server we would force-close the attacker's sockets instantly with
+\texttt{ss -K} (\texttt{SOCK\_DESTROY}). Our test kernel (WSL2) does not support
+that, so the half-open sockets linger and fresh workers re-accept them. Restarting
+the container reliably clears them on this platform. Because the availability probe
+runs on the host, the measured recovery is real. On production Linux the lighter
+socket-kill would be used and no restart would be needed.
+
+\item[Q15. What are precision, recall, F1, and FPR?]
+Precision: of what we flagged as attack, how much truly was. Recall: of all real
+attacks, how many we caught. F1: their balanced average. FPR: of benign items, how
+many we wrongly flagged --- the one we most want low, because it means not blocking
+honest users.
+
+\item[Q16. What is SHAP and why did you use it?]
+SHAP explains which features drove each prediction. We used it to confirm the model
+decides based on header completion and incompleteness --- the signals we
+engineered --- rather than on an artefact of the setup.
+
+\item[Q17. How is your work different from prior ML detectors?]
+Prior work mostly stops at detection on recorded data. We close the loop with
+automatic, container-native mitigation and recovery, and we use a layer-7
+completion feature that flow-level detectors cannot compute.
+
+\item[Q18. How is it different from an SDN or firewall-based defense?]
+An SDN defense acts at the network fabric using timing/rate and cannot see
+header completion. Ours acts inside the container runtime --- the same vocabulary
+the platform uses to manage tenants --- and uses the layer-7 signal. The two are
+complementary.
+
+\item[Q19. What are the limitations?]
+HTTPS hides the layer-7 feature unless TLS is terminated at the monitor;
+timing-randomising attackers stress the timing features (but not completion); the
+testbed is single-host; thresholds need tuning; and the reclaim mechanism is
+platform-specific (the WSL2 caveat).
+
+\item[Q20. Could the attacker evade your detector?]
+They can randomise timing to blur the inter-arrival features, but they cannot
+complete the request without releasing the worker --- so the completion feature
+remains discriminative. If they complete requests, it is no longer Slowloris.
+
+\item[Q21. What is the contribution if the detection is ``easy''?]
+The contribution is not the detector's accuracy --- it is the automatic,
+container-native loop that \emph{acts} on the detection in real time and restores
+service with zero false isolations, plus the layer-7 feature that makes the
+honest-vs-attacker distinction possible.
+
+\item[Q22. How would you deploy this in production / at scale?]
+Move to Kubernetes with NetworkPolicy-based pod isolation for cluster-wide scope,
+use eBPF for low-overhead line-rate monitoring, terminate TLS at a proxy so the
+layer-7 feature works on HTTPS, and re-fit the thresholds to the real service's
+pool size and traffic profile.
+
+\item[Q23. Is running this attack legal/ethical?]
+Yes, as we did it: everything runs inside an isolated Docker network against our own
+victim container, and the attack script is allow-listed to the lab subnet and
+refuses any external target. We never touched a real or third-party system.
+
+\item[Q24. What did you personally learn / what was hardest?]
+The hardest part was making recovery actually work on our kernel: isolating the
+attacker was not enough because half-open sockets lingered. Diagnosing that it was
+the missing \texttt{SOCK\_DESTROY} kernel feature, and engineering a reliable
+reclaim around it, was the key engineering lesson.
+
+\item[Q25. If you had more time, what is the first thing you would add?]
+Kubernetes deployment with pod-level isolation and validation on a public dataset,
+to show the approach generalises beyond our single-host lab.
+\end{description}
+
+% ---------------- PART XIV DEMO ----------------
+\section{Part XIV --- Live Demo Script}
+\begin{enumerate}
+  \item \textbf{Set up (before examiners watch):} \texttt{docker compose up -d};
+  open \texttt{http://localhost:8090}. Point out the service is \emph{ONLINE} and
+  workers are idle.
+  \item \textbf{Show the baseline:} normal/slow benign traffic is flowing and the
+  availability chart is at 100\%. Say: ``these include deliberately slow honest
+  users --- the system must not block them.''
+  \item \textbf{Launch the attack:} run the attacker command. Narrate: ``200
+  connections, each sending headers that never finish.''
+  \item \textbf{Watch detection:} saturation gauge climbs toward 100\%; attack
+  probability spikes. Say: ``the model sees many long-lived incomplete flows from
+  one source while the server is saturated.''
+  \item \textbf{Watch mitigation:} the action log shows \texttt{DROP\_IP},
+  \texttt{ISOLATE\_CONTAINER}, \texttt{RECLAIM\_POOL}. Availability snaps back to
+  100\%.
+  \item \textbf{Point out zero false positives:} the benign source was never
+  touched --- only the attacker.
+  \item \textbf{Watch restore:} after the cooldown the log shows
+  \texttt{RESTORE\_IP} / \texttt{RESTORE\_CONTAINER}; the system is back to normal
+  with no manual action.
+  \item \textbf{Close:} ``this detect-isolate-reclaim-restore sequence, running
+  automatically inside the container runtime, is our contribution.''
+  \item \textbf{Stop:} \texttt{docker compose down}.
+\end{enumerate}
+\textbf{Backup:} if the live demo misbehaves, show the saved figures in
+\texttt{results/} (\texttt{fig\_availability.png}, \texttt{fig\_timeline.png}) and
+the paper's results tables --- they are from a real recorded run.
+
+% ---------------- PART XV ----------------
+\section{Part XV --- Team Roles (Suggested Split)}
+\begin{center}
+\begin{tabular}{>{\raggedright}p{0.32\textwidth} p{0.60\textwidth}}
+\toprule
+\textbf{Area} & \textbf{Deliverable} \\
+\midrule
+Lab \& victim & Docker testbed, vulnerable Apache, attack reproduction. \\
+Detection & Feature extraction, model training, SHAP, baselines. \\
+Mitigation & Closed loop: isolate, reclaim, cooldown/restore, dashboard. \\
+Evaluation \& paper & Experiments, figures, and the write-up. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section*{Key References (full list in the paper)}
+Cambiaso et al., \emph{Slow DoS Attacks: Definition and Categorisation} (2013);
+Praseed \& Thilagam, \emph{HTTP Request Pattern Based Signatures} (2022);
+Sharif et al., \emph{Detection of Application-layer DDoS using ML and Genetic
+Algorithms} (2023); Lukaseder et al., \emph{SDN-Assisted Mitigation of Slow DDoS}
+(2018); Sharafaldin et al., CIC-IDS2017 (2018); Chen \& Guestrin, \emph{XGBoost}
+(2016); Lundberg \& Lee, \emph{SHAP} (2017).
+
+\vfill
+\begin{center}\itshape
+End of report. All experiments were conducted inside an isolated laboratory
+network against a self-hosted target.
+\end{center}
+
+\end{document}
